@@ -131,14 +131,7 @@ public class ProxyController {
         requestBodyName += "." + requestContentType.getSubtype();
       }
 
-      if (requestContentType != null && requestContentType
-          .isCompatibleWith(MediaType.APPLICATION_JSON)) {
-        // Reformat json for easy viewing
-        Files.write(dir.resolve(requestBodyName), objectMapper.writerWithDefaultPrettyPrinter()
-            .writeValueAsBytes(objectMapper.readTree(requestBody)));
-      } else {
-        Files.write(dir.resolve(requestBodyName), requestBody);
-      }
+      Files.write(dir.resolve(requestBodyName), requestBody);
     }
 
     Files.write(dir.resolve("request-info.json"),
@@ -187,13 +180,7 @@ public class ProxyController {
         responseBodyPatchedName += "." + requestContentType.getSubtype();
       }
 
-      if (isResponseJson) {
-        // Reformat json for easy viewing
-        Files.write(dir.resolve(responseBodyName), objectMapper.writerWithDefaultPrettyPrinter()
-            .writeValueAsBytes(objectMapper.readTree(responseBody)));
-      } else {
-        Files.write(dir.resolve(responseBodyName), responseBody);
-      }
+      Files.write(dir.resolve(responseBodyName), responseBody);
     }
 
     if (isResponseJson) {
