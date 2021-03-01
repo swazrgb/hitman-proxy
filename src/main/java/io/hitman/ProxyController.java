@@ -17,10 +17,13 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 import javax.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.http.impl.client.HttpClientBuilder;
@@ -44,7 +47,6 @@ import org.springframework.web.client.RestTemplate;
 @Controller
 @Slf4j
 public class ProxyController {
-
   private static final DateTimeFormatter FILENAME_DTF = DateTimeFormatter
       .ofPattern("yyyy-MM-dd-HH-mm-ss-SSS");
   private static final String VCAP_SUFFIX = ".vcap.me";
@@ -125,13 +127,48 @@ public class ProxyController {
     Files.createDirectories(dir);
 
     String requestBodyName = null;
+    String requestBodyPatchedName = null;
+
     if (requestBody != null) {
       requestBodyName = "request-body";
+      requestBodyPatchedName = requestBodyName + "-patched";
       if (requestContentType != null) {
         requestBodyName += "." + requestContentType.getSubtype();
+        requestBodyPatchedName += "." + requestContentType.getSubtype();
       }
 
       Files.write(dir.resolve(requestBodyName), requestBody);
+    }
+
+    byte[] origRequestBody = requestBody;
+    String lpath = path == null ? null : path.toLowerCase();
+    if (lpath != null && "POST".equals(method) && (
+        lpath.startsWith(
+            "/authentication/api/userchannel/EventsService/SaveAndSynchronizeEvents".toLowerCase())
+            ||
+            lpath.startsWith(
+                "/authentication/api/userchannel/EventsService/SaveEvents".toLowerCase())
+    )) {
+      JsonNode json = objectMapper.readTree(requestBody);
+      for (JsonNode value : json.path("values")) {
+        if ("ExitInventory".equals(value.path("Name").asText())) {
+          Iterator<JsonNode> itemIterator = value.path("Value").iterator();
+          List<String> wantItemIds = wantItemIds();
+          while (itemIterator.hasNext()) {
+            JsonNode item = itemIterator.next();
+            if (wantItemIds.remove(item.path("RepositoryId").asText())) {
+              itemIterator.remove();
+            }
+          }
+        }
+      }
+
+      requestBody = objectMapper.writeValueAsBytes(json);
+    }
+
+    boolean didPatchRequest = !Arrays.equals(origRequestBody, requestBody);
+    if (requestBody != null && didPatchRequest) {
+      Files.write(dir.resolve(requestBodyPatchedName), requestBody);
     }
 
     Files.write(dir.resolve("request-info.json"),
@@ -139,7 +176,8 @@ public class ProxyController {
             method,
             proxyUrl,
             requestHeaders,
-            requestBodyName
+            requestBodyName,
+            didPatchRequest ? requestBodyPatchedName : null
         )));
 
     RequestEntity.BodyBuilder requestBuilder = RequestEntity
@@ -190,6 +228,7 @@ public class ProxyController {
         strBody = strBody.replaceAll("(?i)https://([^/\"]+)", "http://$1.vcap.me");
       }
 
+      // Patch the items in during planning
       if ("/profiles/page/Planning".equalsIgnoreCase(path)) {
         ObjectNode json = (ObjectNode) objectMapper.readTree(strBody);
         ArrayNode loadoutData = (ArrayNode) json.path("data").path("LoadoutData");
@@ -201,29 +240,27 @@ public class ProxyController {
 
             JsonNode item = loadout
                 .path("Recommended")
-                .path("item")
-                .path("Unlockable")
-                .path("Properties");
+                .path("item");
 
             if (item.isMissingNode()) {
               continue;
             }
 
-            // dda002e9-02b1-4208-82a5-cf059f3c79cf = coin
-            if ("dda002e9-02b1-4208-82a5-cf059f3c79cf".equals(item.path("RepositoryId").asText())) {
-              ArrayNode repositoryAssets = (ArrayNode) item.path("RepositoryAssets");
-              ArrayNode gameAssets = (ArrayNode) item.path("GameAssets");
-              repositoryAssets.removeAll();
+            JsonNode itemProperties = item
+                .path("Unlockable")
+                .path("Properties");
 
-              wantItemNames().forEach(name -> {
-                for (RepositoryEntry repositoryEntry : repositoryEntries) {
-                  if (name.equalsIgnoreCase(repositoryEntry.getTitle()) ||
-                      name.equalsIgnoreCase(repositoryEntry.getCommonName())) {
-                    repositoryAssets.add(repositoryEntry.getId());
-                    return;
-                  }
-                }
-              });
+            if (itemProperties.isMissingNode()) {
+              continue;
+            }
+
+            // dda002e9-02b1-4208-82a5-cf059f3c79cf = coin
+            if ("dda002e9-02b1-4208-82a5-cf059f3c79cf"
+                .equals(itemProperties.path("RepositoryId").asText())) {
+              ArrayNode repositoryAssets = (ArrayNode) itemProperties.path("RepositoryAssets");
+              ArrayNode gameAssets = (ArrayNode) itemProperties.path("GameAssets");
+              repositoryAssets.removeAll();
+              wantItemIds().forEach(repositoryAssets::add);
             }
           }
         }
@@ -237,14 +274,7 @@ public class ProxyController {
     boolean didPatchResponse = !Arrays.equals(origResponseBody, responseBody);
 
     if (responseBody != null && didPatchResponse) {
-      if (isResponseJson) {
-        // Reformat json for easy viewing
-        Files.write(dir.resolve(responseBodyPatchedName),
-            objectMapper.writerWithDefaultPrettyPrinter()
-                .writeValueAsBytes(objectMapper.readTree(responseBody)));
-      } else {
         Files.write(dir.resolve(responseBodyPatchedName), responseBody);
-      }
     }
 
     Files.write(dir.resolve("response-info.json"),
@@ -274,6 +304,22 @@ public class ProxyController {
     return resultBody.body(responseBody);
   }
 
+  private List<String> wantItemIds() {
+    return wantItemNames().stream()
+        .map(name -> {
+          for (RepositoryEntry repositoryEntry : repositoryEntries) {
+            if (name.equalsIgnoreCase(repositoryEntry.getTitle()) ||
+                name.equalsIgnoreCase(repositoryEntry.getCommonName())) {
+              return repositoryEntry.getId();
+            }
+          }
+
+          return null;
+        })
+        .filter(Objects::nonNull)
+        .collect(Collectors.toList());
+  }
+
   private List<String> wantItemNames() {
     List<String> names = new ArrayList<>();
 
@@ -281,13 +327,17 @@ public class ProxyController {
     add(names, "(Dartgun) Kalmer 1 - Tranquilizer", 1);
     add(names, "(Tool) Lock pick S3", 1);
     add(names, "(Tool) Crowbar Professional", 1);
+    add(names, "(S3) Tool_Keycard Hacker Electrical MK III", 100);
     add(names, "Lethal Poison Syringe", 100);
+    add(names, "Lethal Pills", 100);
     add(names, "Sedative Syringe", 100);
+    add(names, "Sedative Pills", 100);
     add(names, "Emetic Poison Syringe", 100);
-    add(names, "Remote Explosive RubberDuck", 35);
-    add(names, "Remote Explosive RubberDuck S2", 35);
-    add(names, "Remote Explosive RubberDuck STA", 35);
-    add(names, "SONY PREORDER WHITE REMOTE RUBBERDUCK EXPLOSIVE", 35);
+    add(names, "Emetic Pills", 100);
+    add(names, "Remote Explosive RubberDuck", 25);
+    add(names, "Remote Explosive RubberDuck S2", 25);
+    add(names, "Remote Explosive RubberDuck STA", 25);
+    add(names, "SONY PREORDER WHITE REMOTE RUBBERDUCK EXPLOSIVE", 25);
 
     return names;
   }

@@ -10,4 +10,5 @@ public class LoggedRequest {
   private final String url;
   private final Map<String, List<String>> headers;
   private final String requestBodyName;
+  private final String requestBodyPatchedName;
 }
