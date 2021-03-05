@@ -1,6 +1,3 @@
-WARNING: Completing a mission using this may get your account (temporarily?) banned, or at least
-temporarily disabled.
-
 Run this application (will use port 80) and use localghost patcher with server
 address `config.vcap.me` then launch the game.
 
