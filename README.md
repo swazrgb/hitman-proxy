@@ -1,5 +1,5 @@
-WARNING: Completing a mission using this may get your account (temporarily?) banned, or at least
-temporarily disabled.
+WARNING: If you have a large amount of items added using this mod and complete the mission without
+having the mod active, then your account may be (temporarily?) disabled.
 
 Run this application (will use port 80) and use localghost patcher with server
 address `config.hitman.io.vcap.me` then launch the game.
