@@ -1,0 +1,19 @@
+module hitman.proxy {
+  requires lombok;
+  requires net.harawata.appdirs;
+  requires spring.core;
+  requires spring.context;
+  requires java.desktop;
+  requires org.slf4j;
+  requires com.fasterxml.jackson.databind;
+  requires java.annotation;
+  requires forms.rt;
+  requires org.apache.commons.io;
+  requires org.apache.tomcat.embed.core;
+  requires org.apache.httpcomponents.httpclient;
+  requires spring.beans;
+  requires spring.web;
+  requires com.formdev.flatlaf;
+  requires spring.boot;
+  requires spring.boot.autoconfigure;
+}

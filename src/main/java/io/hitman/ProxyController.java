@@ -1,12 +1,13 @@
 package io.hitman;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.hitman.model.LoggedRequest;
+import io.hitman.model.LoggedResponse;
+import io.hitman.model.SelectedItem;
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -16,17 +17,15 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 import javax.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.http.impl.client.HttpClientBuilder;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -47,32 +46,31 @@ import org.springframework.web.client.RestTemplate;
 @Controller
 @Slf4j
 public class ProxyController {
+
   private static final DateTimeFormatter FILENAME_DTF = DateTimeFormatter
       .ofPattern("yyyy-MM-dd-HH-mm-ss-SSS");
-  private static final String VCAP_SUFFIX = ".vcap.me";
+  private static final String VCAP_SUFFIX = "vcap.me";
 
   private final ObjectMapper objectMapper;
   private final RestTemplate restTemplate;
-  private final Map<String, RepositoryEntry> repository;
-  private final List<RepositoryEntry> repositoryEntries;
+  private final ConfigStore configStore;
+  //  private final Map<String, RepositoryEntry> repository;
+//  private final List<RepositoryEntry> repositoryEntries;
   private final Path logDir;
+
+  private final String port;
+  private final String portSuffix;
 
   private final AtomicInteger atomicIdx = new AtomicInteger(0);
 
-  public ProxyController(ResourceLoader resourceLoader, ObjectMapper objectMapper)
-      throws IOException {
+  public ProxyController(ResourceLoader resourceLoader, ObjectMapper objectMapper,
+      ConfigStore configStore, @Value("${server.port}") String port) {
     this.objectMapper = objectMapper;
+    this.configStore = configStore;
 
-    try (InputStream is = resourceLoader.getResource("classpath:/repository.json")
-        .getInputStream()) {
-      Map<String, RepositoryEntry> repository = new ObjectMapper()
-          .readValue(is, new TypeReference<Map<String, RepositoryEntry>>() {
-          });
-
-      this.repository = Collections.unmodifiableMap(repository);
-      this.repositoryEntries = Collections.unmodifiableList(new ArrayList<>(repository.values()));
-      this.logDir = Paths.get("logs", "session-" + now());
-    }
+    this.logDir = Paths.get("logs", "session-" + now());
+    this.port = port;
+    this.portSuffix = ":" + port;
 
     HttpComponentsClientHttpRequestFactory clientHttpRequestFactory = new HttpComponentsClientHttpRequestFactory(
         HttpClientBuilder.create().build());
@@ -99,14 +97,22 @@ public class ProxyController {
       @RequestParam(required = false) MultiValueMap<String, String> requestParams
   ) throws Exception {
     String host = request.getHeader("Host");
+    if (host.endsWith(portSuffix)) {
+      host = host.substring(0, host.length() - portSuffix.length());
+    }
+
     if (!host.endsWith(VCAP_SUFFIX)) {
       return ResponseEntity.badRequest()
           .body(("Unknown host: " + host).getBytes(StandardCharsets.UTF_8));
     }
 
+    // config.vcap.me -> config.
+    // vcap.me -> vcap.me
     host = host.substring(0, host.length() - VCAP_SUFFIX.length());
-    if (host.equals("config")) {
-      host += ".hitman.io";
+    if (host.isEmpty()) {
+      host = "config.hitman.io";
+    } else {
+      host = host.substring(0, host.length() - 1);
     }
 
     String path = request.getServletPath();
@@ -153,12 +159,16 @@ public class ProxyController {
       for (JsonNode value : json.path("values")) {
         if ("ExitInventory".equals(value.path("Name").asText())) {
           Iterator<JsonNode> itemIterator = value.path("Value").iterator();
-          List<String> wantItemIds = wantItemIds();
+          Set<String> knownCoinIds = configStore.getKnownCoinIds();
+//          List<String> wantItemIds = wantItemIds();
           while (itemIterator.hasNext()) {
             JsonNode item = itemIterator.next();
-            if (wantItemIds.remove(item.path("RepositoryId").asText())) {
+            if (knownCoinIds.contains(item.path("InstanceId").asText())) {
               itemIterator.remove();
             }
+//            if (wantItemIds.remove(item.path("RepositoryId").asText())) {
+//              itemIterator.remove();
+//            }
           }
         }
       }
@@ -225,24 +235,63 @@ public class ProxyController {
       String strBody = new String(responseBody, StandardCharsets.UTF_8);
 
       if ("config.hitman.io".equals(host)) {
-        strBody = strBody.replaceAll("(?i)https://([^/\"]+)", "http://$1.vcap.me");
+//        strBody = strBody.replaceAll("(?i)https://([^/\"']+.hitman.io)", "http://$1.vcap.me:" + port);
+        strBody = strBody.replaceAll("https://hm3-service.hitman.io", "http://hm3-service.hitman.io.vcap.me");
+      }
+
+      if ("/profiles/page/Stashpoint".equalsIgnoreCase(path)) {
+        ObjectNode json = (ObjectNode) objectMapper.readTree(strBody);
+
+        JsonNode items = json.path("data").path("LoadoutItemsData").path("Items");
+        for (JsonNode item : items) {
+          JsonNode itemProperties = item.path("Item").path("Unlockable").path("Properties");
+          if (itemProperties.isMissingNode()) {
+            continue;
+          }
+
+          // dda002e9-02b1-4208-82a5-cf059f3c79cf = coin
+          if ("dda002e9-02b1-4208-82a5-cf059f3c79cf"
+              .equals(itemProperties.path("RepositoryId").asText())) {
+            String instanceId = item.get("Item").get("InstanceId").asText();
+            if (instanceId != null && !instanceId.isEmpty()) {
+              configStore.addKnownCoinId(instanceId);
+              ArrayNode repositoryAssets = (ArrayNode) itemProperties.path("RepositoryAssets");
+              repositoryAssets.removeAll();
+              wantItemIds().forEach(repositoryAssets::add);
+            }
+          }
+        }
+
+        strBody = objectMapper.writeValueAsString(json);
       }
 
       // Patch the items in during planning
       if ("/profiles/page/Planning".equalsIgnoreCase(path)) {
         ObjectNode json = (ObjectNode) objectMapper.readTree(strBody);
-        ArrayNode loadoutData = (ArrayNode) json.path("data").path("LoadoutData");
-        if (loadoutData != null) {
-          for (JsonNode loadout : loadoutData) {
-            if (loadout == null || !"gear".equals(loadout.path("SlotName").asText())) {
-              continue;
-            }
 
-            JsonNode item = loadout
-                .path("Recommended")
-                .path("item");
+        // Allow all kinds of starts
+        for (JsonNode entrance : json.path("data").path("Entrances")) {
+          JsonNode loadoutSettings = entrance.path("Properties").path("LoadoutSettings");
+          if (loadoutSettings.path("GearSlotsEnabledCount").isNumber()) {
+            ((ObjectNode) loadoutSettings).put("GearSlotsEnabledCount", 2);
+            ((ObjectNode) loadoutSettings).put("GearSlotsAllowContainers", true);
+            ((ObjectNode) loadoutSettings).put("ConcealedWeaponSlotEnabled", true);
+          }
+        }
 
-            if (item.isMissingNode()) {
+        // Add the items instead of coin
+        JsonNode loadoutData = json.path("data").path("LoadoutData");
+//        if (!loadoutData.isMissingNode() && !loadoutData.isNull()) {
+        for (JsonNode loadout : loadoutData) {
+          if (loadout == null || !"gear".equals(loadout.path("SlotName").asText())) {
+            continue;
+          }
+
+          JsonNode item = loadout
+              .path("Recommended")
+              .path("item");
+
+          if (item.isMissingNode()) {
               continue;
             }
 
@@ -257,12 +306,15 @@ public class ProxyController {
             // dda002e9-02b1-4208-82a5-cf059f3c79cf = coin
             if ("dda002e9-02b1-4208-82a5-cf059f3c79cf"
                 .equals(itemProperties.path("RepositoryId").asText())) {
-              ArrayNode repositoryAssets = (ArrayNode) itemProperties.path("RepositoryAssets");
-              ArrayNode gameAssets = (ArrayNode) itemProperties.path("GameAssets");
-              repositoryAssets.removeAll();
-              wantItemIds().forEach(repositoryAssets::add);
+              String instanceId = item.get("InstanceId").asText();
+              if (instanceId != null && !instanceId.isEmpty()) {
+                configStore.addKnownCoinId(instanceId);
+                ArrayNode repositoryAssets = (ArrayNode) itemProperties.path("RepositoryAssets");
+                repositoryAssets.removeAll();
+                wantItemIds().forEach(repositoryAssets::add);
+              }
             }
-          }
+//          }
         }
 
         strBody = objectMapper.writeValueAsString(json);
@@ -279,6 +331,7 @@ public class ProxyController {
 
     Files.write(dir.resolve("response-info.json"),
         objectMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(new LoggedResponse(
+            responseEntity.getStatusCodeValue(),
             responseEntity.getHeaders(),
             responseBodyName,
             didPatchResponse ? responseBodyPatchedName : null
@@ -305,48 +358,78 @@ public class ProxyController {
   }
 
   private List<String> wantItemIds() {
-    return wantItemNames().stream()
-        .map(name -> {
-          for (RepositoryEntry repositoryEntry : repositoryEntries) {
-            if (name.equalsIgnoreCase(repositoryEntry.getTitle()) ||
-                name.equalsIgnoreCase(repositoryEntry.getCommonName())) {
-              return repositoryEntry.getId();
-            }
-          }
+    List<String> result = new ArrayList<>();
+    for (SelectedItem entry : configStore.getActiveLoadout().getEntries()) {
+      if (entry.getAmount() <= 0) {
+        continue;
+      }
 
-          return null;
-        })
-        .filter(Objects::nonNull)
-        .collect(Collectors.toList());
-  }
-
-  private List<String> wantItemNames() {
-    List<String> names = new ArrayList<>();
-
-    add(names, "(Dartgun) Sick", 1);
-    add(names, "(Dartgun) Kalmer 1 - Tranquilizer", 1);
-    add(names, "(Tool) Lock pick S3", 1);
-    add(names, "(Tool) Crowbar Professional", 1);
-    add(names, "(S3) Tool_Keycard Hacker Electrical MK III", 100);
-    add(names, "Lethal Poison Syringe", 100);
-    add(names, "Lethal Pills", 100);
-    add(names, "Sedative Syringe", 100);
-    add(names, "Sedative Pills", 100);
-    add(names, "Emetic Poison Syringe", 100);
-    add(names, "Emetic Pills", 100);
-    add(names, "Remote Explosive RubberDuck", 25);
-    add(names, "Remote Explosive RubberDuck S2", 25);
-    add(names, "Remote Explosive RubberDuck STA", 25);
-    add(names, "SONY PREORDER WHITE REMOTE RUBBERDUCK EXPLOSIVE", 25);
-
-    return names;
-  }
-
-  private void add(List<String> names, String name, int amount) {
-    for (int i = 0; i < amount; i++) {
-      names.add(name);
+      for (int i = 0; i < entry.getAmount(); i++) {
+        result.add(entry.getId());
+      }
     }
+
+    return result;
+
+//    return wantItemNames().stream()
+//        .map(name -> {
+//          for (RepositoryEntry repositoryEntry : repositoryEntries) {
+//            if (name.equalsIgnoreCase(repositoryEntry.getTitle()) ||
+//                name.equalsIgnoreCase(repositoryEntry.getCommonName())) {
+//              return repositoryEntry.getId();
+//            }
+//          }
+//
+//          return null;
+//        })
+//        .filter(Objects::nonNull)
+//        .collect(Collectors.toList());
   }
+
+//  private List<String> wantItemNames() {
+//    List<String> names = new ArrayList<>();
+//
+//    // (Dartgun) Tracker
+//    // (Dartgun) Cure I
+//    // (Dartgun) Cure II
+//    // (Device) Remote Cure Gas Large
+//    // (Device) Remote Emetic Gas
+//    // (Device) Remote Lethal Gas
+//    // (Device) Remote Sedative Gas
+////    add(names, "(Dartgun) Tracker", 1);
+//    add(names, "(Tool) Coin Cure", 10);
+////    add(names, "Electronics Crate", 1);
+////    add(names, "MAGIC_WATCH", 2); // buggy & cheat engine can do this too
+//    add(names, "(Device) Remote Emetic Gas", 25);
+//    add(names, "(Device) Remote Lethal Gas", 100);
+//    add(names, "(Device) Remote Sedative Gas", 25);
+//
+//    add(names, "(Dartgun) Sick", 1);
+//    add(names, "(Dartgun) Kalmer 1 - Tranquilizer", 1);
+//    add(names, "(Pistol) The Wall Piecer", 1);
+//    add(names, "(Tool) Lock pick S3", 1);
+//    add(names, "(Tool) Crowbar Professional", 1);
+//    add(names, "(S3) Tool_Keycard Hacker Electrical MK III", 10);
+//    add(names, "Lethal Poison Syringe", 100);
+//    add(names, "Lethal Pills", 25);
+////    add(names, "Sedative Syringe", 10);
+//    add(names, "Sedative Pills", 10);
+////    add(names, "Emetic Poison Syringe", 10);
+//    add(names, "Emetic Pills", 10);
+//    add(names, "Remote Explosive RubberDuck", 25);
+//    add(names, "Remote Explosive RubberDuck S2", 25);
+//    add(names, "(S3) ICA Device Semtex Remote Explosive MK III", 100);
+////    add(names, "Remote Explosive RubberDuck STA", 25);
+////    add(names, "SONY PREORDER WHITE REMOTE RUBBERDUCK EXPLOSIVE", 25);
+//
+//    return names;
+//  }
+
+//  private void add(List<String> names, String name, int amount) {
+//    for (int i = 0; i < amount; i++) {
+//      names.add(name);
+//    }
+//  }
 
   private String now() {
     return LocalDateTime.now().format(FILENAME_DTF);
